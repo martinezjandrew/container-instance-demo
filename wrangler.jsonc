@@ -1,20 +1,20 @@
 {
-  "name": "container-instance-demo",
+  "name": "andrew-instance-demo",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-17",
   "durable_objects": {
     "bindings": [
       {
         "name": "SANDBOX",
-        "class_name": "Sandbox"
-      }
-    ]
+        "class_name": "Sandbox",
+      },
+    ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["Sandbox"]
-    }
+      "new_sqlite_classes": ["Sandbox"],
+    },
   ],
   "containers": [
     {
@@ -22,12 +22,12 @@
       "scheduling_policy": "durable_object",
       "images": {
         "app": {
-          "dockerfile": "./container/Dockerfile"
-        }
-      }
-    }
+          "dockerfile": "./container/Dockerfile",
+        },
+      },
+    },
   ],
   "observability": {
-    "enabled": true
-  }
+    "enabled": true,
+  },
 }
