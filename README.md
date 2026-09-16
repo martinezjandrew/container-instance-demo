@@ -8,6 +8,8 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 
 ## Current features
 
+- Home page for creating a canvas or joining one by ID
+- Shareable canvas URLs at `/canvas/:id`
 - Canvas dimensions from 128×128 through 1024×1024
 - Circular brush from 1 through 64 pixels
 - Color and background pickers
@@ -59,13 +61,17 @@ pnpm run deploy
 
 Wrangler builds and pushes `container/Dockerfile`, deploys the Worker, and creates the Durable Object-managed Container application.
 
-Open the resulting Worker URL. The default shared canvas is named `shared-canvas`. Change the Canvas ID to create or join another canvas.
+Open the resulting Worker URL to reach the home page. Create a new canvas with a unique ID, or join an existing canvas using an ID shared by another user. Canvas URLs are directly shareable:
+
+```text
+https://your-worker.your-subdomain.workers.dev/canvas/weekend-doodles
+```
 
 ## Using the canvas
 
-1. Choose a canvas ID and dimensions.
-2. Select **Open or create**.
-3. Open the same canvas ID in another browser tab to collaborate.
+1. On the home page, choose a name, unique canvas ID, and dimensions.
+2. Select **Create canvas**.
+3. Share the resulting `/canvas/:id` URL, or have another user enter its ID under **Join a canvas**.
 4. Choose a brush color and size, then draw.
 5. Use the mouse wheel to zoom.
 6. Hold Space and drag to pan.
