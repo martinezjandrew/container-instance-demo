@@ -1,125 +1,146 @@
-# Durable Object-managed Containers demo
+# Snapshot Canvas
 
-A minimal Worker whose Durable Objects start namespace-backed containers on demand.
+A collaborative pixel drawing app built with Cloudflare Workers, Durable Objects, Containers, and Container snapshots.
+
+Each canvas ID maps to one Durable Object and one Durable Object-managed Container. The Durable Object orders and broadcasts brush strokes over WebSockets, while the Container owns the authoritative RGBA image and stores it at `/data/canvas.png`. Named Container snapshots provide revision checkpoints and restore.
+
+See [`plan.md`](./plan.md) for the full architecture and delivery plan.
+
+## Current features
+
+- Canvas dimensions from 128×128 through 1024×1024
+- Circular brush from 1 through 64 pixels
+- Color and background pickers
+- Collaborative drawing over WebSockets
+- Client-side zoom from 25% through 3200%
+- Space-drag panning
+- Named Container snapshots
+- Snapshot history and collaborative restore
+- One Container per canvas ID
+
+## Architecture
+
+```text
+Browser ──HTTP/WebSocket──> Worker ──> Canvas Durable Object
+                                             │
+                                             │ private HTTP
+                                             ▼
+                                      Canvas Container
+                                      /data/canvas.png
+```
+
+The Container is authoritative for pixels. The Durable Object is authoritative for stroke ordering, revisions, connected clients, and snapshot metadata.
 
 ## Prerequisites
 
-- Node.js, pnpm, and Docker
-- A Cloudflare account with Workers, Containers, and the new runtime enabled.
+- Node.js and pnpm
+- Docker
+- Go 1.24 for local Container tests
+- A Cloudflare account with Workers, Containers, Container snapshots, and the new runtime enabled
 
-## Deploy
+The project currently uses Wrangler's latest `main` preview build because the Container instance and snapshot APIs are preview features.
 
-Install dependencies:
+## Install and verify
 
 ```bash
 pnpm install
+pnpm exec tsc --noEmit
+cd container && go test ./...
 ```
 
-Use Wrangler's latest `main` preview build.
+## Deploy
 
-Authenticate, then deploy with the main preview build:
+Authenticate and deploy with the preview Wrangler build:
 
 ```bash
-npx --yes https://pkg.pr.new/wrangler@main whoami
-npx --yes https://pkg.pr.new/wrangler@main deploy
+pnpm run wrangler -- whoami
+pnpm run deploy
 ```
 
-Wrangler builds and pushes the image, prepares it to run on Cloudflare, uploads the Worker, and creates the namespace-backed application.
+Wrangler builds and pushes `container/Dockerfile`, deploys the Worker, and creates the Durable Object-managed Container application.
 
-## Try it
+Open the resulting Worker URL. The default shared canvas is named `shared-canvas`. Change the Canvas ID to create or join another canvas.
 
-Set the Worker URL printed by Wrangler, including the `https://` scheme:
+## Using the canvas
+
+1. Choose a canvas ID and dimensions.
+2. Select **Open or create**.
+3. Open the same canvas ID in another browser tab to collaborate.
+4. Choose a brush color and size, then draw.
+5. Use the mouse wheel to zoom.
+6. Hold Space and drag to pan.
+7. Select **Save snapshot** to create a named checkpoint.
+8. Select **Restore** beside a snapshot to return every collaborator to that revision.
+
+Canvas creation is idempotent. Reopening an existing ID uses its original dimensions and background.
+
+## HTTP and WebSocket API
+
+```text
+POST /api/canvases/:id
+GET  /api/canvases/:id
+GET  /api/canvases/:id/image
+GET  /api/canvases/:id/connect       # WebSocket upgrade
+POST /api/canvases/:id/snapshots
+GET  /api/canvases/:id/snapshots
+POST /api/canvases/:id/snapshots/:snapshotId/restore
+```
+
+Create or open a canvas:
 
 ```bash
 export BASE="https://your-worker.your-subdomain.workers.dev"
+
+curl -X POST "$BASE/api/canvases/demo" \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"Demo","width":256,"height":256,"background":"#ffffff"}'
 ```
 
-Then call the Worker:
+Fetch the authoritative PNG:
 
 ```bash
-curl "$BASE/?instance=first"
-curl "$BASE/_status?instance=first"
-curl "$BASE/_destroy?instance=first"
+curl "$BASE/api/canvases/demo/image" --output demo.png
 ```
 
-Each `instance` value selects a different Durable Object and container.
-
-Append one or more HTML lines to `/index.html` (the file is created on the first write):
+Create a snapshot:
 
 ```bash
-curl -X POST "$BASE/append?instance=first" \
-  --data-binary $'<h1>Hello</h1>\n<p>From the container</p>'
+curl -X POST "$BASE/api/canvases/demo/snapshots" \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"First sketch"}'
 ```
 
-View the document in a browser:
+List snapshots:
 
 ```bash
-open "$BASE/index.html?instance=first"
+curl "$BASE/api/canvases/demo/snapshots"
 ```
 
-Remove a line by its one-based line number:
+Restore using an ID returned by the list endpoint:
 
 ```bash
-curl -X DELETE "$BASE/remove?instance=first&line=2"
+curl -X POST "$BASE/api/canvases/demo/snapshots/SNAPSHOT_ID/restore"
 ```
 
-Removing a line returns `404` when `index.html` or the requested line does not exist.
+## Container API
 
-For a Worker protected by Cloudflare Access, use `cloudflared access curl` and put the URL
-before all curl arguments:
+The Container is only reached through its owning Durable Object:
 
-```bash
-cloudflared access curl "$BASE/append?instance=first" \
-  -X POST \
-  --data-binary $'<h1>Hello</h1>\n<p>From the container</p>'
+```text
+POST /initialize
+POST /strokes
+POST /flush
+GET  /canvas.png
+GET  /metadata
+GET  /health
 ```
 
-A regular `workers.dev` URL that is not protected by Access only needs plain `curl`.
+Before taking a snapshot, the Durable Object calls `/flush` so the checkpoint includes an atomically written PNG and metadata file. A restore destroys the running Container, starts from the selected immutable snapshot, verifies its metadata, and broadcasts a full image reset to connected clients.
 
-## Snapshots
+## Current limitations
 
-Create a named snapshot of the running container. The response includes the immutable snapshot ID,
-size, and elapsed snapshot time:
-
-```bash
-curl -X POST "$BASE/_snapshot?instance=first&name=S1"
-```
-
-Modify `index.html` and create additional generations:
-
-```bash
-curl -X POST "$BASE/append?instance=first" --data-binary $'<p>Generation 2</p>'
-curl -X POST "$BASE/_snapshot?instance=first&name=S2"
-
-curl -X POST "$BASE/append?instance=first" --data-binary $'<p>Generation 3</p>'
-curl -X POST "$BASE/_snapshot?instance=first&name=S3"
-```
-
-List the snapshots stored for this instance:
-
-```bash
-curl "$BASE/_snapshots?instance=first"
-```
-
-Restore any generation independently. Restoring destroys the currently running container first;
-the response includes the elapsed restore time:
-
-```bash
-curl -X POST "$BASE/_restore?instance=first&name=S1"
-open "$BASE/index.html?instance=first"
-
-curl -X POST "$BASE/_restore?instance=first&name=S3"
-open "$BASE/index.html?instance=first"
-```
-
-A missing snapshot returns `404`. Snapshot handles are stored in the Durable Object, snapshots are
-immutable, and `image` is not passed when restoring because `image` and `containerSnapshot` are
-mutually exclusive. Snapshots currently have an implicit 30-day retention period refreshed by each
-restore.
-
-## What changed
-
-- The top-level `containers[]` entry attaches a Durable Object-managed application to the `Sandbox` namespace.
-- `scheduling_policy: "durable_object"` makes each Durable Object own its container lifecycle.
-- The named `images.app` configuration tells Wrangler to build, push, and prepare the image.
-- The Worker prefers `ctx.container.images.app` and falls back to Wrangler's temporary `env.EXPERIMENTAL_CLOUDFLARE_CONTAINER_IMAGES.Sandbox.app` binding while native image metadata rolls out. If neither supplies an image, it reports a configuration error before starting the container.
+- Snapshots are preview functionality and should not be treated as permanent backups.
+- The current MVP creates manual snapshots; automatic rolling snapshots are still planned.
+- A canvas without a snapshot is not yet recovered from an unexpected Container replacement.
+- Authentication, permissions, presence cursors, erasing, and canvas forking are not implemented yet.
+- Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce very small edge differences until the browser reloads the canonical PNG.
