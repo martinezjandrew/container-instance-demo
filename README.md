@@ -13,7 +13,9 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Canvas dimensions from 128×128 through 1024×1024
 - Circular brush and eraser from 1 through 64 pixels
 - Color and background pickers
-- Collaborative drawing over WebSockets
+- Collaborative drawing, live viewer presence, and remote cursors over WebSockets
+- Hoverable remote cursors that reveal each viewer's display name
+- Cloud-formation guest names with optional custom display names
 - Client-side zoom from 25% through 3200%
 - Space-drag panning
 - Named Container snapshots

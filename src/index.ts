@@ -5,6 +5,11 @@ const CONTAINER_PORT = 8080;
 const SNAPSHOT_PREFIX = "snapshot:";
 const METADATA_KEY = "canvas:metadata";
 const COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
+const CLOUD_NAMES = [
+  "Cirrus", "Cumulus", "Stratus", "Nimbus", "Altocumulus", "Altostratus",
+  "Cirrostratus", "Cirrocumulus", "Stratocumulus", "Nimbostratus", "Mammatus",
+  "Lenticular", "Noctilucent", "Contrail", "Virga", "Kelvin-Helmholtz",
+] as const;
 
 type CanvasMetadata = {
   id: string;
@@ -44,7 +49,7 @@ type StoredCanvasSnapshot = {
   snapshotElapsedMs: number;
 };
 
-type SocketAttachment = { clientId: string };
+type SocketAttachment = { clientId: string; name: string };
 
 export class Sandbox extends DurableObject<Env> {
   private operationQueue: Promise<void> = Promise.resolve();
@@ -201,6 +206,30 @@ export class Sandbox extends DurableObject<Env> {
     return input as StrokeInput;
   }
 
+  private displayName(value: unknown, exclude?: WebSocket): string {
+    if (typeof value === "string") {
+      const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, "").trim().replace(/\s+/g, " ");
+      if (cleaned) return cleaned.slice(0, 32);
+    }
+
+    const used = new Set(
+      this.ctx.getWebSockets()
+        .filter((socket) => socket !== exclude && socket.readyState === 1)
+        .map((socket) => (socket.deserializeAttachment() as SocketAttachment | null)?.name)
+        .filter((name): name is string => Boolean(name)),
+    );
+    return CLOUD_NAMES.find((name) => !used.has(name)) ??
+      `${CLOUD_NAMES[this.ctx.getWebSockets().filter((socket) => socket.readyState === 1).length % CLOUD_NAMES.length]} ${this.ctx.getWebSockets().filter((socket) => socket.readyState === 1).length + 1}`;
+  }
+
+  private broadcastPresence(): void {
+    const users = this.ctx.getWebSockets().filter((socket) => socket.readyState === 1).flatMap((socket) => {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+      return attachment ? [{ clientId: attachment.clientId, name: attachment.name }] : [];
+    });
+    this.broadcast({ type: "presence", users });
+  }
+
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = socket.deserializeAttachment() as SocketAttachment | null;
     if (!attachment || typeof message !== "string" || message.length > 4_096) return;
@@ -213,8 +242,37 @@ export class Sandbox extends DurableObject<Env> {
       return;
     }
 
+    if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "set-name") {
+      attachment.name = this.displayName((parsed as { name?: unknown }).name, socket);
+      socket.serializeAttachment(attachment);
+      this.broadcastPresence();
+      return;
+    }
+
     const metadata = await this.metadata();
     if (!metadata) return;
+    if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "cursor") {
+      const cursor = parsed as { x?: unknown; y?: unknown; visible?: unknown };
+      if (cursor.visible === false) {
+        this.broadcast({ type: "cursor", clientId: attachment.clientId, name: attachment.name, visible: false });
+        return;
+      }
+      if (typeof cursor.x !== "number" || typeof cursor.y !== "number" ||
+          !Number.isFinite(cursor.x) || !Number.isFinite(cursor.y) ||
+          cursor.x < 0 || cursor.y < 0 || cursor.x >= metadata.width || cursor.y >= metadata.height) {
+        return;
+      }
+      this.broadcast({
+        type: "cursor",
+        clientId: attachment.clientId,
+        name: attachment.name,
+        x: cursor.x,
+        y: cursor.y,
+        visible: true,
+      });
+      return;
+    }
+
     let stroke: StrokeInput;
     try {
       stroke = this.validateStroke(parsed, metadata);
@@ -304,12 +362,20 @@ export class Sandbox extends DurableObject<Env> {
 
   async webSocketClose(socket: WebSocket): Promise<void> {
     const attachment = socket.deserializeAttachment() as SocketAttachment | null;
-    if (attachment) this.recentStrokeIds.delete(attachment.clientId);
+    if (attachment) {
+      this.recentStrokeIds.delete(attachment.clientId);
+      this.broadcast({ type: "cursor", clientId: attachment.clientId, visible: false });
+    }
+    this.broadcastPresence();
   }
 
   async webSocketError(socket: WebSocket): Promise<void> {
     const attachment = socket.deserializeAttachment() as SocketAttachment | null;
-    if (attachment) this.recentStrokeIds.delete(attachment.clientId);
+    if (attachment) {
+      this.recentStrokeIds.delete(attachment.clientId);
+      this.broadcast({ type: "cursor", clientId: attachment.clientId, visible: false });
+    }
+    this.broadcastPresence();
   }
 
   private broadcast(message: unknown): void {
@@ -334,17 +400,21 @@ export class Sandbox extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     const clientId = crypto.randomUUID();
-    server.serializeAttachment({ clientId } satisfies SocketAttachment);
+    const requestedName = new URL(request.url).searchParams.get("name");
+    const name = this.displayName(requestedName);
+    server.serializeAttachment({ clientId, name } satisfies SocketAttachment);
     this.ctx.acceptWebSocket(server);
     server.send(JSON.stringify({
       type: "welcome",
       clientId,
+      name,
       revision: metadata.revision,
       width: metadata.width,
       height: metadata.height,
       background: metadata.background,
       imageUrl: `/api/canvases/${encodeURIComponent(metadata.id)}/image?v=${metadata.revision}`,
     }));
+    this.broadcastPresence();
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -608,14 +678,16 @@ const APP_HTML = String.raw`<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Snapshot Canvas</title>
 <style>
-:root{color-scheme:dark;--panel:#171923;--border:#303445;--accent:#7c5cff}*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;background:#0d0f15;color:#f4f4f7;height:100vh;overflow:hidden}button,input{font:inherit}button{color:#fff;background:#262a38;border:1px solid #3b4053;border-radius:7px;padding:7px 10px;cursor:pointer}button:hover{border-color:#7c5cff}button.active{background:#7c5cff;border-color:#9b87ff}button:disabled{opacity:.5;cursor:wait}header{height:54px;display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border)}header strong{font-size:17px}header a{color:inherit;text-decoration:none}.spacer{flex:1}.status{color:#a7adbd}.app{height:calc(100vh - 54px);display:grid;grid-template-columns:220px 1fr 240px}.panel{padding:14px;background:var(--panel);overflow:auto}.left{border-right:1px solid var(--border)}.right{border-left:1px solid var(--border)}label{display:block;color:#aeb4c4;margin:12px 0 5px}input[type=text],input[type=number]{width:100%;padding:8px;background:#0f1119;color:#fff;border:1px solid #393e50;border-radius:6px}input[type=color]{width:100%;height:38px;background:none;border:0}.row{display:flex;gap:7px}.row>*{flex:1}.workspace{overflow:auto;background:#252836;position:relative}.stage{min-width:100%;min-height:100%;display:flex;align-items:center;justify-content:center;padding:80px}.canvas-wrap{box-shadow:0 8px 35px #0008;line-height:0}canvas{background:#fff;image-rendering:pixelated;touch-action:none;cursor:crosshair}.snapshot{padding:9px 0;border-bottom:1px solid var(--border)}.snapshot b{display:block}.snapshot small{display:block;color:#979dad;margin:4px 0 7px}.empty{color:#888e9e}.error{color:#ff8e9b}.zoom{min-width:64px;text-align:center}dialog{width:min(520px,calc(100vw - 32px));padding:0;color:#f4f4f7;background:#171923;border:1px solid #3a3f52;border-radius:14px;box-shadow:0 24px 90px #000b}dialog::backdrop{background:#080a10bf;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;padding:16px 18px;border-bottom:1px solid var(--border)}.dialog-head h2{margin:0;font-size:19px}.dialog-head button{margin-left:auto;padding:4px 9px}.dialog-body{padding:18px}.dialog-section+ .dialog-section{margin-top:22px;padding-top:20px;border-top:1px solid var(--border)}.dialog-section h3{margin:0 0 4px}.dialog-section p{margin:0 0 10px;color:#969cad}.dialog-message{min-height:18px;margin-top:8px;color:#ff8e9b}
+:root{color-scheme:dark;--panel:#171923;--border:#303445;--accent:#7c5cff}*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;background:#0d0f15;color:#f4f4f7;height:100vh;overflow:hidden}button,input{font:inherit}button{color:#fff;background:#262a38;border:1px solid #3b4053;border-radius:7px;padding:7px 10px;cursor:pointer}button:hover{border-color:#7c5cff}button.active{background:#7c5cff;border-color:#9b87ff}button:disabled{opacity:.5;cursor:wait}header{height:54px;display:flex;align-items:center;gap:10px;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border)}header strong{font-size:17px}header a{color:inherit;text-decoration:none}.presence{display:flex;align-items:center;gap:6px;min-width:0;overflow-x:auto;scrollbar-width:thin}.presence-label{color:#858c9d;font-size:12px}.person{max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 8px;border:1px solid #41475c;border-radius:999px;background:#232735;color:#dce0ec;font-size:12px}.person.me{border-color:#8068ff;background:#312958}.spacer{flex:1}.status{color:#a7adbd}.app{height:calc(100vh - 54px);display:grid;grid-template-columns:220px 1fr 240px}.panel{padding:14px;background:var(--panel);overflow:auto}.left{border-right:1px solid var(--border)}.right{border-left:1px solid var(--border)}label{display:block;color:#aeb4c4;margin:12px 0 5px}input[type=text],input[type=number]{width:100%;padding:8px;background:#0f1119;color:#fff;border:1px solid #393e50;border-radius:6px}input[type=color]{width:100%;height:38px;background:none;border:0}.row{display:flex;gap:7px}.row>*{flex:1}.workspace{overflow:auto;background:#252836;position:relative}.stage{min-width:100%;min-height:100%;display:flex;align-items:center;justify-content:center;padding:80px}.canvas-wrap{position:relative;box-shadow:0 8px 35px #0008;line-height:0}canvas{background:#fff;image-rendering:pixelated;touch-action:none;cursor:crosshair}.cursor-layer{position:absolute;inset:0;pointer-events:none;overflow:visible}.remote-cursor{position:absolute;width:16px;height:22px;pointer-events:auto;z-index:5;transition:left 45ms linear,top 45ms linear}.cursor-arrow{position:absolute;inset:0;background:var(--cursor-color);clip-path:polygon(0 0,0 17px,5px 13px,9px 21px,12px 19px,8px 12px,16px 12px);filter:drop-shadow(0 1px 1px #000)}.cursor-name{position:absolute;left:13px;top:17px;line-height:1;padding:5px 7px;color:#fff;background:#10121bdc;border:1px solid var(--cursor-color);border-radius:5px;white-space:nowrap;opacity:0;transform:translateY(3px);transition:opacity .12s,transform .12s;pointer-events:none}.remote-cursor:hover .cursor-name{opacity:1;transform:translateY(0)}.snapshot{padding:9px 0;border-bottom:1px solid var(--border)}.snapshot b{display:block}.snapshot small{display:block;color:#979dad;margin:4px 0 7px}.empty{color:#888e9e}.error{color:#ff8e9b}.zoom{min-width:64px;text-align:center}dialog{width:min(520px,calc(100vw - 32px));padding:0;color:#f4f4f7;background:#171923;border:1px solid #3a3f52;border-radius:14px;box-shadow:0 24px 90px #000b}dialog::backdrop{background:#080a10bf;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;padding:16px 18px;border-bottom:1px solid var(--border)}.dialog-head h2{margin:0;font-size:19px}.dialog-head button{margin-left:auto;padding:4px 9px}.dialog-body{padding:18px}.dialog-section+ .dialog-section{margin-top:22px;padding-top:20px;border-top:1px solid var(--border)}.dialog-section h3{margin:0 0 4px}.dialog-section p{margin:0 0 10px;color:#969cad}.dialog-message{min-height:18px;margin-top:8px;color:#ff8e9b}
 </style>
 </head>
 <body>
-<header><strong><a href="/">Snapshot Canvas</a></strong><span id="title"></span><span class="spacer"></span><span id="status" class="status">Starting…</span><button id="forkBtn">Fork canvas</button><button id="snapshotBtn">Save snapshot</button></header>
+<header><strong><a href="/">Snapshot Canvas</a></strong><span id="title"></span><div id="presence" class="presence"></div><span class="spacer"></span><span id="status" class="status">Starting…</span><button id="forkBtn">Fork canvas</button><button id="snapshotBtn">Save snapshot</button></header>
 <div class="app">
 <aside class="panel left">
 <button id="openBtn" style="width:100%">Open or create</button>
+<hr style="border:0;border-top:1px solid #303445;margin:18px 0">
+<label>Your name</label><input id="displayName" type="text" maxlength="32" placeholder="Assigned cloud name">
 <hr style="border:0;border-top:1px solid #303445;margin:18px 0">
 <label>Tool</label><div class="row"><button id="brushBtn" class="active">Brush</button><button id="eraserBtn">Eraser</button></div>
 <label>Brush color</label><input id="color" type="color" value="#7c5cff">
@@ -623,7 +695,7 @@ const APP_HTML = String.raw`<!doctype html>
 <label>Zoom</label><div class="row"><button id="zoomOut">−</button><button id="zoomReset" class="zoom">100%</button><button id="zoomIn">+</button></div>
 <p class="status">Wheel to zoom. Hold Space and drag to pan.</p>
 </aside>
-<main id="workspace" class="workspace"><div class="stage"><div class="canvas-wrap"><canvas id="canvas" width="256" height="256"></canvas></div></div></main>
+<main id="workspace" class="workspace"><div class="stage"><div class="canvas-wrap"><canvas id="canvas" width="256" height="256"></canvas><div id="cursorLayer" class="cursor-layer"></div></div></div></main>
 <aside class="panel right"><strong>Snapshots</strong><div id="snapshots"><p class="empty">No snapshots yet.</p></div></aside>
 </div>
 <dialog id="canvasDialog">
@@ -637,7 +709,7 @@ const APP_HTML = String.raw`<!doctype html>
 </div></dialog>
 <script>
 const $=id=>document.getElementById(id);const canvas=$('canvas'),ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
-let socket,currentId='',revision=0,zoom=1,tool='brush',canvasBackground='#ffffff',drawing=false,lastPoint=null,sentPoint=null,lastSentAt=0,panning=false,panStart=null;
+let socket,currentId='',clientId='',revision=0,zoom=1,tool='brush',canvasBackground='#ffffff',drawing=false,lastPoint=null,sentPoint=null,lastSentAt=0,lastCursorAt=0,panning=false,panStart=null,nameTimer;const cursorElements=new Map();
 const status=(text,bad=false)=>{$('status').textContent=text;$('status').className=bad?'status error':'status'};
 const api=(path,options)=>fetch('/api/canvases/'+encodeURIComponent(currentId)+path,options).then(async r=>{if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||('Request failed: '+r.status));return r});
 function setZoom(next,cx,cy){const workspace=$('workspace'),old=zoom;zoom=Math.max(.25,Math.min(32,next));const rect=workspace.getBoundingClientRect();const x=cx===undefined?rect.left+rect.width/2:cx;const y=cy===undefined?rect.top+rect.height/2:cy;const imageX=(workspace.scrollLeft+x-rect.left)/old;const imageY=(workspace.scrollTop+y-rect.top)/old;canvas.style.width=(canvas.width*zoom)+'px';canvas.style.height=(canvas.height*zoom)+'px';workspace.scrollLeft=imageX*zoom-(x-rect.left);workspace.scrollTop=imageY*zoom-(y-rect.top);$('zoomReset').textContent=Math.round(zoom*100)+'%'}
@@ -645,14 +717,19 @@ function point(event){const rect=canvas.getBoundingClientRect();return{x:Math.ma
 function draw(from,to,size,color){ctx.strokeStyle=color;ctx.lineWidth=size;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();ctx.moveTo(from.x,from.y);ctx.lineTo(to.x,to.y);ctx.stroke()}
 function activeColor(selectedTool=tool,color=$('color').value){return selectedTool==='eraser'?canvasBackground:color}
 function sendStroke(from,to){if(!socket||socket.readyState!==1)return;socket.send(JSON.stringify({type:'stroke',strokeId:crypto.randomUUID(),tool,from,to,size:Number($('size').value),color:$('color').value}))}
+function sendCursor(position,visible=true){if(!socket||socket.readyState!==1)return;socket.send(JSON.stringify(visible?{type:'cursor',x:position.x,y:position.y,visible:true}:{type:'cursor',visible:false}))}
 function loadImage(url){return new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>{ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(image,0,0);resolve()};image.onerror=reject;image.src=url+'&t='+Date.now()})}
 const validCanvasId=id=>/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id);
 async function loadCurrentCanvas(){status('Opening…');try{const response=await fetch('/api/canvases/'+encodeURIComponent(currentId));if(response.status===404){$('canvasDialog').showModal();throw new Error('Canvas does not exist. Create it or open another canvas.')}const meta=await response.json();if(!response.ok)throw new Error(meta.error||'Could not open canvas.');canvas.width=meta.width;canvas.height=meta.height;canvasBackground=meta.background;revision=meta.revision;$('title').textContent='— '+meta.name;setZoom(zoom);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision);connect();await listSnapshots();status('Connected')}catch(error){status(error.message,true)}}
 async function createCanvas(){const id=$('createCanvasId').value.trim(),message=$('createCanvasMessage');if(!validCanvasId(id)){message.textContent='Use letters, numbers, underscores, or hyphens.';return}const button=$('createCanvasBtn');button.disabled=true;message.textContent='';try{const response=await fetch('/api/canvases/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:id,width:Number($('createWidth').value),height:Number($('createHeight').value),background:$('createBackground').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Could not create canvas.');if(response.status===200)throw new Error('That canvas ID already exists. Open it below.');location.href='/canvas/'+encodeURIComponent(id)}catch(error){message.textContent=error.message}finally{button.disabled=false}}
 async function openExistingCanvas(){const id=$('existingCanvasId').value.trim(),message=$('openCanvasMessage');if(!validCanvasId(id)){message.textContent='Enter a valid canvas ID.';return}const button=$('openExistingBtn');button.disabled=true;message.textContent='';try{const response=await fetch('/api/canvases/'+encodeURIComponent(id));if(response.status===404)throw new Error('That canvas does not exist.');if(!response.ok){const data=await response.json();throw new Error(data.error||'Could not open canvas.')}location.href='/canvas/'+encodeURIComponent(id)}catch(error){message.textContent=error.message}finally{button.disabled=false}}
-function connect(){if(socket)socket.close();const protocol=location.protocol==='https:'?'wss:':'ws:';socket=new WebSocket(protocol+'//'+location.host+'/api/canvases/'+encodeURIComponent(currentId)+'/connect');socket.onopen=()=>status('Connected');socket.onclose=()=>{status('Disconnected',true);setTimeout(()=>{if(currentId)connect()},1500)};socket.onmessage=async event=>{const message=JSON.parse(event.data);if(message.type==='welcome'){revision=message.revision;canvas.width=message.width;canvas.height=message.height;canvasBackground=message.background;setZoom(zoom);await loadImage(message.imageUrl)}else if(message.type==='stroke'){revision=message.revision;draw(message.from,message.to,message.size,activeColor(message.tool,message.color))}else if(message.type==='reset'){revision=message.revision;await loadImage(message.imageUrl);status('Snapshot restored')}else if(message.type==='restore-started')status('Restoring…');else if(message.type==='snapshot-created')listSnapshots();else if(message.type==='stroke-rejected'){status('Stroke rejected; reloading',true);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision)}else if(message.type==='server-error')status('Canvas persistence is retrying…',true)}}
+function connect(){if(socket)socket.close();const protocol=location.protocol==='https:'?'wss:':'ws:',name=$('displayName').value.trim();socket=new WebSocket(protocol+'//'+location.host+'/api/canvases/'+encodeURIComponent(currentId)+'/connect?name='+encodeURIComponent(name));socket.onopen=()=>status('Connected');socket.onclose=()=>{status('Disconnected',true);setTimeout(()=>{if(currentId)connect()},1500)};socket.onmessage=async event=>{const message=JSON.parse(event.data);if(message.type==='welcome'){clientId=message.clientId;if(!$('displayName').value.trim())$('displayName').value=message.name;revision=message.revision;canvas.width=message.width;canvas.height=message.height;canvasBackground=message.background;setZoom(zoom);await loadImage(message.imageUrl)}else if(message.type==='stroke'){revision=message.revision;draw(message.from,message.to,message.size,activeColor(message.tool,message.color))}else if(message.type==='reset'){revision=message.revision;await loadImage(message.imageUrl);status('Snapshot restored')}else if(message.type==='restore-started')status('Restoring…');else if(message.type==='snapshot-created')listSnapshots();else if(message.type==='stroke-rejected'){status('Stroke rejected; reloading',true);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision)}else if(message.type==='server-error')status('Canvas persistence is retrying…',true);else if(message.type==='presence')renderPresence(message.users);else if(message.type==='cursor')renderCursor(message)}}
+function cursorColor(id){let hash=0;for(let i=0;i<id.length;i++)hash=(hash*31+id.charCodeAt(i))|0;return 'hsl('+Math.abs(hash%360)+' 85% 65%)'}
+function renderCursor(cursor){if(cursor.clientId===clientId)return;let element=cursorElements.get(cursor.clientId);if(cursor.visible===false){if(element)element.remove();cursorElements.delete(cursor.clientId);return}if(!element){element=document.createElement('div');element.className='remote-cursor';element.style.setProperty('--cursor-color',cursorColor(cursor.clientId));const arrow=document.createElement('span');arrow.className='cursor-arrow';const name=document.createElement('span');name.className='cursor-name';element.append(arrow,name);$('cursorLayer').append(element);cursorElements.set(cursor.clientId,element)}element.querySelector('.cursor-name').textContent=cursor.name;element.style.left=(cursor.x/canvas.width*100)+'%';element.style.top=(cursor.y/canvas.height*100)+'%'}
+function renderPresence(users){const root=$('presence');root.replaceChildren();const active=new Set(users.map(user=>user.clientId));for(const [id,element] of cursorElements){if(!active.has(id)){element.remove();cursorElements.delete(id)}}const label=document.createElement('span');label.className='presence-label';label.textContent='Viewing:';root.append(label);for(const user of users){const person=document.createElement('span');person.className='person'+(user.clientId===clientId?' me':'');person.textContent=user.name;person.title=user.name+(user.clientId===clientId?' (you)':'');root.append(person);const cursor=cursorElements.get(user.clientId);if(cursor)cursor.querySelector('.cursor-name').textContent=user.name}}
 canvas.addEventListener('pointerdown',event=>{if(event.button!==0||panning)return;drawing=true;lastPoint=point(event);sentPoint=lastPoint;lastSentAt=performance.now();canvas.setPointerCapture(event.pointerId);draw(lastPoint,lastPoint,Number($('size').value),activeColor());sendStroke(lastPoint,lastPoint)});
-canvas.addEventListener('pointermove',event=>{if(!drawing||!lastPoint||!sentPoint)return;const next=point(event);draw(lastPoint,next,Number($('size').value),activeColor());lastPoint=next;const now=performance.now();if(now-lastSentAt>=32){sendStroke(sentPoint,next);sentPoint=next;lastSentAt=now}});
+canvas.addEventListener('pointermove',event=>{const next=point(event),now=performance.now();if(now-lastCursorAt>=32){sendCursor(next);lastCursorAt=now}if(!drawing||!lastPoint||!sentPoint)return;draw(lastPoint,next,Number($('size').value),activeColor());lastPoint=next;if(now-lastSentAt>=32){sendStroke(sentPoint,next);sentPoint=next;lastSentAt=now}});
+canvas.addEventListener('pointerleave',()=>sendCursor({x:0,y:0},false));
 canvas.addEventListener('pointerup',()=>{if(lastPoint&&sentPoint&&(lastPoint.x!==sentPoint.x||lastPoint.y!==sentPoint.y))sendStroke(sentPoint,lastPoint);drawing=false;lastPoint=null;sentPoint=null});canvas.addEventListener('pointercancel',()=>{drawing=false;lastPoint=null;sentPoint=null});
 $('workspace').addEventListener('wheel',event=>{event.preventDefault();setZoom(zoom*(event.deltaY<0?1.15:1/1.15),event.clientX,event.clientY)},{passive:false});
 window.addEventListener('keydown',event=>{if(event.code==='Space'&&!event.repeat){panning=true;$('workspace').style.cursor='grab';event.preventDefault()}});window.addEventListener('keyup',event=>{if(event.code==='Space'){panning=false;panStart=null;$('workspace').style.cursor=''}});
@@ -662,6 +739,8 @@ async function saveSnapshot(){const name=prompt('Snapshot name');if(!name)return
 async function forkCanvas(){const suggested=currentId+'-fork',id=prompt('New canvas ID',suggested);if(!id)return;if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)){status('Invalid fork canvas ID',true);return}const name=prompt('New canvas name',id);if(name===null)return;$('forkBtn').disabled=true;status('Forking canvas…');try{const data=await (await api('/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:name||id})})).json();location.href=data.url}catch(error){status(error.message,true);$('forkBtn').disabled=false}}
 async function restore(id,name){if(!confirm('Restore “'+name+'”? Current unsnapshotted changes will be lost.'))return;try{await api('/snapshots/'+encodeURIComponent(id)+'/restore',{method:'POST'});await listSnapshots()}catch(error){status(error.message,true)}}
 function selectTool(next){tool=next;$('brushBtn').classList.toggle('active',tool==='brush');$('eraserBtn').classList.toggle('active',tool==='eraser');canvas.style.cursor=tool==='eraser'?'cell':'crosshair'}
+function updateName(){const name=$('displayName').value.trim();localStorage.setItem('snapshot-canvas-name',name);if(socket&&socket.readyState===1)socket.send(JSON.stringify({type:'set-name',name}))}
+$('displayName').value=localStorage.getItem('snapshot-canvas-name')||'';$('displayName').addEventListener('input',()=>{clearTimeout(nameTimer);nameTimer=setTimeout(updateName,250)});$('displayName').addEventListener('keydown',event=>{if(event.key==='Enter'){clearTimeout(nameTimer);updateName();event.target.blur()}});
 $('openBtn').onclick=()=>$('canvasDialog').showModal();$('closeDialog').onclick=()=>$('canvasDialog').close();$('createCanvasBtn').onclick=createCanvas;$('openExistingBtn').onclick=openExistingCanvas;$('existingCanvasId').addEventListener('keydown',event=>{if(event.key==='Enter')openExistingCanvas()});$('snapshotBtn').onclick=saveSnapshot;$('forkBtn').onclick=forkCanvas;$('brushBtn').onclick=()=>selectTool('brush');$('eraserBtn').onclick=()=>selectTool('eraser');$('size').oninput=()=>$('sizeValue').textContent=$('size').value;$('zoomIn').onclick=()=>setZoom(zoom*1.25);$('zoomOut').onclick=()=>setZoom(zoom/1.25);$('zoomReset').onclick=()=>setZoom(1);
 currentId=decodeURIComponent(location.pathname.split('/')[2]||'');loadCurrentCanvas();
 </script>
