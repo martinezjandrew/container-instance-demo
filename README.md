@@ -18,6 +18,7 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Space-drag panning
 - Named Container snapshots
 - Snapshot history and collaborative restore
+- Forking the current canvas into a new canvas and Container
 - One Container per canvas ID
 
 ## Architecture
@@ -77,6 +78,7 @@ https://your-worker.your-subdomain.workers.dev/canvas/weekend-doodles
 6. Hold Space and drag to pan.
 7. Select **Save snapshot** to create a named checkpoint.
 8. Select **Restore** beside a snapshot to return every collaborator to that revision.
+9. Select **Fork canvas** to clone the current image into a new canvas with its own URL and Container.
 
 Canvas creation is idempotent. Reopening an existing ID uses its original dimensions and background.
 
@@ -89,6 +91,7 @@ GET  /api/canvases/:id/image
 GET  /api/canvases/:id/connect       # WebSocket upgrade
 POST /api/canvases/:id/snapshots
 GET  /api/canvases/:id/snapshots
+POST /api/canvases/:id/fork
 POST /api/canvases/:id/snapshots/:snapshotId/restore
 ```
 
@@ -148,5 +151,6 @@ Before taking a snapshot, the Durable Object calls `/flush` so the checkpoint in
 - Snapshots are preview functionality and should not be treated as permanent backups.
 - The current MVP creates manual snapshots; automatic rolling snapshots are still planned.
 - A canvas without a snapshot is not yet recovered from an unexpected Container replacement.
-- Authentication, permissions, presence cursors, erasing, and canvas forking are not implemented yet.
+- Authentication, permissions, presence cursors, and erasing are not implemented yet.
+- Forking depends on snapshot handles being reusable across Durable Object-managed Containers in the deployed preview runtime.
 - Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce very small edge differences until the browser reloads the canonical PNG.

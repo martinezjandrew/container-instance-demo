@@ -394,6 +394,97 @@ export class Sandbox extends DurableObject<Env> {
     return Response.json({ snapshots });
   }
 
+  private async forkCanvas(request: Request): Promise<Response> {
+    return await this.exclusive(async () => {
+      const source = await this.metadata();
+      if (!source) return Response.json({ error: "Canvas does not exist." }, { status: 404 });
+
+      const input = await request.json() as { id?: unknown; name?: unknown };
+      const targetId = typeof input.id === "string" ? input.id.trim() : "";
+      const targetName = typeof input.name === "string" && input.name.trim()
+        ? input.name.trim().slice(0, 80)
+        : targetId;
+      if (!validCanvasId(targetId)) {
+        return Response.json(
+          { error: "New canvas ID must use letters, numbers, underscores, or hyphens." },
+          { status: 400 },
+        );
+      }
+      if (targetId === source.id) {
+        return Response.json({ error: "The fork must use a different canvas ID." }, { status: 400 });
+      }
+
+      const target = this.env.SANDBOX.get(this.env.SANDBOX.idFromName(targetId));
+      if (await target.canvasExists()) {
+        return Response.json({ error: "That canvas ID already exists." }, { status: 409 });
+      }
+
+      await this.flushPendingStrokes();
+      const forkRevision = source.revision;
+      const started = await this.startContainer();
+      if (started) await this.initializeContainer(source);
+      const flush = await this.containerFetch("/flush", { method: "POST" });
+      if (!flush.ok) throw new Error(`Canvas flush failed: ${await flush.text()}`);
+
+      const startedAt = performance.now();
+      const snapshot = await this.container.snapshotContainer({ name: `Fork: ${targetId}` });
+      const stored: StoredCanvasSnapshot = {
+        id: crypto.randomUUID(),
+        name: `Forked to ${targetName}`,
+        snapshot,
+        canvasRevision: forkRevision,
+        createdAt: new Date().toISOString(),
+        size: snapshot.size,
+        snapshotElapsedMs: performance.now() - startedAt,
+      };
+      await this.ctx.storage.put(`${SNAPSHOT_PREFIX}${stored.id}`, stored);
+
+      await target.initializeFromFork(
+        { id: snapshot.id },
+        {
+          ...source,
+          id: targetId,
+          name: targetName,
+          revision: forkRevision,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      );
+      this.broadcast({ type: "snapshot-created", snapshot: this.snapshotDetails(stored) });
+      return Response.json({
+        id: targetId,
+        name: targetName,
+        revision: forkRevision,
+        url: `/canvas/${encodeURIComponent(targetId)}`,
+      }, { status: 201 });
+    });
+  }
+
+  async canvasExists(): Promise<boolean> {
+    return (await this.metadata()) !== undefined;
+  }
+
+  async initializeFromFork(
+    snapshot: ContainerSnapshotRestoreParams,
+    metadata: CanvasMetadata,
+  ): Promise<void> {
+    await this.exclusive(async () => {
+      if (await this.metadata()) throw new Error("That canvas ID already exists.");
+      if (this.container.running) await this.container.destroy();
+      this.container.start({ containerSnapshot: snapshot, enableInternet: false });
+      await this.waitForContainer();
+
+      const response = await this.containerFetch("/metadata");
+      if (!response.ok) throw new Error(`Forked canvas metadata unavailable: ${await response.text()}`);
+      const restored = await response.json() as { revision: number; width: number; height: number };
+      metadata.revision = restored.revision;
+      metadata.width = restored.width;
+      metadata.height = restored.height;
+      this.metadataCache = metadata;
+      await this.ctx.storage.put(METADATA_KEY, metadata);
+    });
+  }
+
   private async restoreSnapshot(snapshotId: string): Promise<Response> {
     return await this.exclusive(async () => {
       const stored = await this.ctx.storage.get<StoredCanvasSnapshot>(`${SNAPSHOT_PREFIX}${snapshotId}`);
@@ -444,6 +535,7 @@ export class Sandbox extends DurableObject<Env> {
       if (action[0] === "connect" && request.method === "GET") return await this.acceptWebSocket(request);
       if (action[0] === "snapshots" && action.length === 1 && request.method === "GET") return await this.listSnapshots();
       if (action[0] === "snapshots" && action.length === 1 && request.method === "POST") return await this.createSnapshot(request);
+      if (action[0] === "fork" && action.length === 1 && request.method === "POST") return await this.forkCanvas(request);
       if (action[0] === "snapshots" && action[2] === "restore" && request.method === "POST") {
         return await this.restoreSnapshot(decodeURIComponent(action[1] ?? ""));
       }
@@ -516,7 +608,7 @@ const APP_HTML = String.raw`<!doctype html>
 </style>
 </head>
 <body>
-<header><strong><a href="/">Snapshot Canvas</a></strong><span id="title"></span><span class="spacer"></span><span id="status" class="status">Starting…</span><button id="snapshotBtn">Save snapshot</button></header>
+<header><strong><a href="/">Snapshot Canvas</a></strong><span id="title"></span><span class="spacer"></span><span id="status" class="status">Starting…</span><button id="forkBtn">Fork canvas</button><button id="snapshotBtn">Save snapshot</button></header>
 <div class="app">
 <aside class="panel left">
 <label>Canvas ID</label><input id="canvasId" type="text" value="shared-canvas" maxlength="64">
@@ -552,8 +644,9 @@ window.addEventListener('keydown',event=>{if(event.code==='Space'&&!event.repeat
 $('workspace').addEventListener('pointerdown',event=>{if(!panning)return;panStart={x:event.clientX,y:event.clientY,left:$('workspace').scrollLeft,top:$('workspace').scrollTop};$('workspace').setPointerCapture(event.pointerId)});$('workspace').addEventListener('pointermove',event=>{if(!panStart)return;$('workspace').scrollLeft=panStart.left-(event.clientX-panStart.x);$('workspace').scrollTop=panStart.top-(event.clientY-panStart.y)});$('workspace').addEventListener('pointerup',()=>panStart=null);
 async function listSnapshots(){try{const data=await (await api('/snapshots')).json();const root=$('snapshots');root.innerHTML='';if(!data.snapshots.length){root.innerHTML='<p class="empty">No snapshots yet.</p>';return}for(const snapshot of data.snapshots){const item=document.createElement('div');item.className='snapshot';const title=document.createElement('b');title.textContent=snapshot.name;const info=document.createElement('small');info.textContent='Revision '+snapshot.canvasRevision+' · '+new Date(snapshot.createdAt).toLocaleString();const button=document.createElement('button');button.textContent='Restore';button.onclick=()=>restore(snapshot.id,snapshot.name);item.append(title,info,button);root.append(item)}}catch(error){status(error.message,true)}}
 async function saveSnapshot(){const name=prompt('Snapshot name');if(!name)return;$('snapshotBtn').disabled=true;status('Saving snapshot…');try{await api('/snapshots',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});await listSnapshots();status('Snapshot saved')}catch(error){status(error.message,true)}finally{$('snapshotBtn').disabled=false}}
+async function forkCanvas(){const suggested=currentId+'-fork',id=prompt('New canvas ID',suggested);if(!id)return;if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)){status('Invalid fork canvas ID',true);return}const name=prompt('New canvas name',id);if(name===null)return;$('forkBtn').disabled=true;status('Forking canvas…');try{const data=await (await api('/fork',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,name:name||id})})).json();location.href=data.url}catch(error){status(error.message,true);$('forkBtn').disabled=false}}
 async function restore(id,name){if(!confirm('Restore “'+name+'”? Current unsnapshotted changes will be lost.'))return;try{await api('/snapshots/'+encodeURIComponent(id)+'/restore',{method:'POST'});await listSnapshots()}catch(error){status(error.message,true)}}
-$('openBtn').onclick=openCanvas;$('snapshotBtn').onclick=saveSnapshot;$('size').oninput=()=>$('sizeValue').textContent=$('size').value;$('zoomIn').onclick=()=>setZoom(zoom*1.25);$('zoomOut').onclick=()=>setZoom(zoom/1.25);$('zoomReset').onclick=()=>setZoom(1);
+$('openBtn').onclick=openCanvas;$('snapshotBtn').onclick=saveSnapshot;$('forkBtn').onclick=forkCanvas;$('size').oninput=()=>$('sizeValue').textContent=$('size').value;$('zoomIn').onclick=()=>setZoom(zoom*1.25);$('zoomOut').onclick=()=>setZoom(zoom/1.25);$('zoomReset').onclick=()=>setZoom(1);
 const initial=decodeURIComponent(location.pathname.split('/')[2]||'');if(initial)$('canvasId').value=initial;openCanvas();
 </script>
 </body></html>`;
