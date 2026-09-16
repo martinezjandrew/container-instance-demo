@@ -11,7 +11,7 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Home page for creating a canvas or joining one by ID
 - Shareable canvas URLs at `/canvas/:id`
 - Canvas dimensions from 128×128 through 1024×1024
-- Circular brush from 1 through 64 pixels
+- Circular brush and eraser from 1 through 64 pixels
 - Color and background pickers
 - Collaborative drawing over WebSockets
 - Client-side zoom from 25% through 3200%
@@ -151,6 +151,6 @@ Before taking a snapshot, the Durable Object calls `/flush` so the checkpoint in
 - Snapshots are preview functionality and should not be treated as permanent backups.
 - The current MVP creates manual snapshots; automatic rolling snapshots are still planned.
 - A canvas without a snapshot is not yet recovered from an unexpected Container replacement.
-- Authentication, permissions, presence cursors, and erasing are not implemented yet.
+- Authentication, permissions, and presence cursors are not implemented yet.
 - Forking depends on snapshot handles being reusable across Durable Object-managed Containers in the deployed preview runtime.
 - Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce very small edge differences until the browser reloads the canonical PNG.

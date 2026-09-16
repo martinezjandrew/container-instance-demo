@@ -31,6 +31,7 @@ type point struct {
 
 type stroke struct {
 	Revision int64  `json:"revision"`
+	Tool     string `json:"tool"`
 	From     point  `json:"from"`
 	To       point  `json:"to"`
 	Size     int    `json:"size"`
@@ -150,7 +151,17 @@ func (s *canvasServer) handleStrokes(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "brush size must be between 1 and 64")
 			return
 		}
-		brushColor, err := parseColor(item.Color)
+		var brushColor color.RGBA
+		var err error
+		switch item.Tool {
+		case "brush":
+			brushColor, err = parseColor(item.Color)
+		case "eraser":
+			brushColor, err = parseColor(s.metadata.Background)
+		default:
+			writeError(w, http.StatusBadRequest, "tool must be brush or eraser")
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
