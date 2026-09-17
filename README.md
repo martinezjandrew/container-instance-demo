@@ -4,8 +4,6 @@ A collaborative pixel drawing app built with Cloudflare Workers, Durable Objects
 
 Each canvas ID maps to one Durable Object and one Durable Object-managed Container. The Durable Object orders and broadcasts brush strokes over WebSockets, while the Container owns the authoritative RGBA image and stores it at `/data/canvas.png`. Immutable Container snapshots act as commits in each canvas's history.
 
-See [`plan.md`](./plan.md) for the full architecture and delivery plan.
-
 ## Current features
 
 - Home page for creating a canvas or joining one by ID
@@ -14,11 +12,6 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Circular brush and eraser from 1 through 64 pixels
 - Color and background pickers
 - Collaborative drawing, live viewer presence, and remote cursors over WebSockets
-- Hoverable remote cursors that reveal each viewer's display name
-- Cloud-formation guest names with optional custom display names
-- Presence heartbeats and stale-viewer cleanup
-- Client-side zoom from 25% through 3200%
-- Space-drag panning
 - Container snapshots represented as named commits
 - Parent-linked commit history and collaborative reset
 - Forking the current canvas into a new canvas and Container
@@ -155,14 +148,17 @@ Before creating a commit, the Durable Object calls `/flush` so its Container sna
 
 ## Presence lifecycle
 
-Open tabs send a small heartbeat every 20 seconds. Normal navigation and tab closure explicitly close the WebSocket through `pagehide`. A Durable Object alarm runs every 30 seconds and removes connections that have not been seen for 90 seconds. Heartbeats stay entirely in the Durable Object and never contact the canvas Container or write a timestamp to persistent storage.
+Open tabs send a small heartbeat every 20 seconds. Normal navigation and tab closure explicitly close the WebSocket through `pagehide`. A Durable Object alarm runs every 30 seconds and removes connections that have not been seen for 90 seconds. Heartbeats stay entirely in the Durable Object, never contact the canvas Container, and do not write heartbeat records to Durable Object storage. `lastSeen` is retained in each WebSocket attachment.
 
 ## Current limitations
 
 - Snapshots are preview functionality and should not be treated as permanent backups.
-- The current MVP creates manual snapshots; automatic rolling snapshots are still planned.
+- Commits are created manually; automatic rolling commits are not implemented.
 - When a stopped or replaced Container is needed again, the canvas restores its `HEAD` commit. Uncommitted work that existed only in the previous Container is discarded.
 - A canvas with no commits has no recovery checkpoint if its Container is replaced.
-- Authentication, permissions, and presence cursors are not implemented yet.
-- Forking depends on snapshot handles being reusable across Durable Object-managed Containers in the deployed preview runtime.
-- Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce very small edge differences until the browser reloads the canonical PNG.
+- Authentication and canvas permissions are not implemented; anyone with a canvas ID can view, draw, commit, fork, or reset it.
+- Commit lineage is stored per canvas in Durable Object storage. There is no global D1-backed fork-network catalog or complete cross-canvas graph yet.
+- Commit previews restore snapshots into ephemeral preview Containers. Their first load can include Container restore latency and consumes Container capacity until inactivity cleanup.
+- Forking and commit previews depend on snapshot handles being reusable across Durable Object-managed Containers in the deployed preview runtime.
+- Reset and snapshot operations do not currently pause incoming WebSocket drawing, so simultaneous edits around those operations need additional coordination.
+- Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce small edge differences until the browser reloads the canonical PNG.
