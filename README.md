@@ -16,6 +16,7 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Collaborative drawing, live viewer presence, and remote cursors over WebSockets
 - Hoverable remote cursors that reveal each viewer's display name
 - Cloud-formation guest names with optional custom display names
+- Presence heartbeats and stale-viewer cleanup
 - Client-side zoom from 25% through 3200%
 - Space-drag panning
 - Container snapshots represented as named commits
@@ -151,6 +152,10 @@ GET  /health
 ```
 
 Before creating a commit, the Durable Object calls `/flush` so its Container snapshot includes an atomically written PNG and metadata file. Reset destroys the running Container, starts from the selected immutable snapshot, verifies its metadata, and broadcasts a full image reset to connected clients. Read-only commit pages use an ephemeral preview Container restored from the commit and stopped after inactivity.
+
+## Presence lifecycle
+
+Open tabs send a small heartbeat every 20 seconds. Normal navigation and tab closure explicitly close the WebSocket through `pagehide`. A Durable Object alarm runs every 30 seconds and removes connections that have not been seen for 90 seconds. Heartbeats stay entirely in the Durable Object and never contact the canvas Container or write a timestamp to persistent storage.
 
 ## Current limitations
 

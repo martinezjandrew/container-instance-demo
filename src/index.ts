@@ -61,7 +61,7 @@ type StoredCanvasCommit = {
   snapshotElapsedMs: number;
 };
 
-type SocketAttachment = { clientId: string; name: string };
+type SocketAttachment = { clientId: string; name: string; lastSeen: number };
 
 export class Sandbox extends DurableObject<Env> {
   private operationQueue: Promise<void> = Promise.resolve();
@@ -275,7 +275,17 @@ export class Sandbox extends DurableObject<Env> {
       return;
     }
 
-    if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "set-name") {
+    const messageType = parsed && typeof parsed === "object"
+      ? (parsed as { type?: unknown }).type
+      : undefined;
+    const now = Date.now();
+    if (messageType === "heartbeat" || now - attachment.lastSeen >= 10_000) {
+      attachment.lastSeen = now;
+      socket.serializeAttachment(attachment);
+    }
+    if (messageType === "heartbeat") return;
+
+    if (messageType === "set-name") {
       attachment.name = this.displayName((parsed as { name?: unknown }).name, socket);
       socket.serializeAttachment(attachment);
       this.broadcastPresence();
@@ -441,7 +451,7 @@ export class Sandbox extends DurableObject<Env> {
     const clientId = crypto.randomUUID();
     const requestedName = new URL(request.url).searchParams.get("name");
     const name = this.displayName(requestedName);
-    server.serializeAttachment({ clientId, name } satisfies SocketAttachment);
+    server.serializeAttachment({ clientId, name, lastSeen: Date.now() } satisfies SocketAttachment);
     this.ctx.acceptWebSocket(server);
     server.send(JSON.stringify({
       type: "welcome",
@@ -454,7 +464,34 @@ export class Sandbox extends DurableObject<Env> {
       imageUrl: `/api/canvases/${encodeURIComponent(metadata.id)}/image?v=${metadata.revision}`,
     }));
     this.broadcastPresence();
+    await this.ensurePresenceAlarm();
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async ensurePresenceAlarm(): Promise<void> {
+    if (await this.ctx.storage.getAlarm() === null) {
+      await this.ctx.storage.setAlarm(Date.now() + 30_000);
+    }
+  }
+
+  async alarm(): Promise<void> {
+    const cutoff = Date.now() - 90_000;
+    let removed = false;
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+      if (socket.readyState !== 1 || !attachment || typeof attachment.lastSeen !== "number" || attachment.lastSeen < cutoff) {
+        removed = true;
+        try {
+          socket.close(4000, "presence timeout");
+        } catch {
+          // The socket may already be gone.
+        }
+      }
+    }
+    if (removed) this.broadcastPresence();
+    if (this.ctx.getWebSockets().some((socket) => socket.readyState === 1)) {
+      await this.ctx.storage.setAlarm(Date.now() + 30_000);
+    }
   }
 
   private commitDetails(stored: StoredCanvasCommit) {
@@ -915,7 +952,7 @@ const APP_HTML = String.raw`<!doctype html>
 </div></dialog>
 <script>
 const $=id=>document.getElementById(id);const canvas=$('canvas'),ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
-let socket,currentId='',clientId='',revision=0,zoom=1,tool='brush',canvasBackground='#ffffff',drawing=false,lastPoint=null,sentPoint=null,lastSentAt=0,lastCursorAt=0,panning=false,panStart=null,nameTimer;const cursorElements=new Map();
+let socket,currentId='',clientId='',revision=0,zoom=1,tool='brush',canvasBackground='#ffffff',drawing=false,lastPoint=null,sentPoint=null,lastSentAt=0,lastCursorAt=0,panning=false,panStart=null,nameTimer,heartbeatTimer,reconnectTimer,leaving=false;const cursorElements=new Map();
 const status=(text,bad=false)=>{$('status').textContent=text;$('status').className=bad?'status error':'status'};
 const api=(path,options)=>fetch('/api/canvases/'+encodeURIComponent(currentId)+path,options).then(async r=>{if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||('Request failed: '+r.status));return r});
 function setZoom(next,cx,cy){const workspace=$('workspace'),old=zoom;zoom=Math.max(.25,Math.min(32,next));const rect=workspace.getBoundingClientRect();const x=cx===undefined?rect.left+rect.width/2:cx;const y=cy===undefined?rect.top+rect.height/2:cy;const imageX=(workspace.scrollLeft+x-rect.left)/old;const imageY=(workspace.scrollTop+y-rect.top)/old;canvas.style.width=(canvas.width*zoom)+'px';canvas.style.height=(canvas.height*zoom)+'px';workspace.scrollLeft=imageX*zoom-(x-rect.left);workspace.scrollTop=imageY*zoom-(y-rect.top);$('zoomReset').textContent=Math.round(zoom*100)+'%'}
@@ -929,7 +966,7 @@ const validCanvasId=id=>/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id);
 async function loadCurrentCanvas(){status('Opening…');try{const response=await fetch('/api/canvases/'+encodeURIComponent(currentId));if(response.status===404){$('canvasDialog').showModal();throw new Error('Canvas does not exist. Create it or open another canvas.')}const meta=await response.json();if(!response.ok)throw new Error(meta.error||'Could not open canvas.');canvas.width=meta.width;canvas.height=meta.height;canvasBackground=meta.background;revision=meta.revision;$('title').textContent='— '+meta.name;const forkBadge=$('forkedFrom');if(meta.forkedFrom){forkBadge.hidden=false;forkBadge.textContent='forked from '+meta.forkedFrom.canvasId+' @ '+meta.forkedFrom.message;forkBadge.onclick=()=>{if(confirm('Open the original canvas? Its current working state may have changed since this commit.'))location.href='/canvas/'+encodeURIComponent(meta.forkedFrom.canvasId)}}else forkBadge.hidden=true;setZoom(zoom);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision);connect();await listSnapshots();status('Connected')}catch(error){status(error.message,true)}}
 async function createCanvas(){const id=$('createCanvasId').value.trim(),message=$('createCanvasMessage');if(!validCanvasId(id)){message.textContent='Use letters, numbers, underscores, or hyphens.';return}const button=$('createCanvasBtn');button.disabled=true;message.textContent='';try{const response=await fetch('/api/canvases/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:id,width:Number($('createWidth').value),height:Number($('createHeight').value),background:$('createBackground').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Could not create canvas.');if(response.status===200)throw new Error('That canvas ID already exists. Open it below.');location.href='/canvas/'+encodeURIComponent(id)}catch(error){message.textContent=error.message}finally{button.disabled=false}}
 async function openExistingCanvas(){const id=$('existingCanvasId').value.trim(),message=$('openCanvasMessage');if(!validCanvasId(id)){message.textContent='Enter a valid canvas ID.';return}const button=$('openExistingBtn');button.disabled=true;message.textContent='';try{const response=await fetch('/api/canvases/'+encodeURIComponent(id));if(response.status===404)throw new Error('That canvas does not exist.');if(!response.ok){const data=await response.json();throw new Error(data.error||'Could not open canvas.')}location.href='/canvas/'+encodeURIComponent(id)}catch(error){message.textContent=error.message}finally{button.disabled=false}}
-function connect(){if(socket)socket.close();const protocol=location.protocol==='https:'?'wss:':'ws:',name=$('displayName').value.trim();socket=new WebSocket(protocol+'//'+location.host+'/api/canvases/'+encodeURIComponent(currentId)+'/connect?name='+encodeURIComponent(name));socket.onopen=()=>status('Connected');socket.onclose=()=>{status('Disconnected',true);setTimeout(()=>{if(currentId)connect()},1500)};socket.onmessage=async event=>{const message=JSON.parse(event.data);if(message.type==='welcome'){clientId=message.clientId;if(!$('displayName').value.trim())$('displayName').value=message.name;revision=message.revision;canvas.width=message.width;canvas.height=message.height;canvasBackground=message.background;setZoom(zoom);await loadImage(message.imageUrl)}else if(message.type==='stroke'){revision=message.revision;draw(message.from,message.to,message.size,activeColor(message.tool,message.color));status('Uncommitted changes')}else if(message.type==='reset'){revision=message.revision;await loadImage(message.imageUrl);status('Commit checked out')}else if(message.type==='reset-started')status('Checking out commit…');else if(message.type==='commit-created'){listSnapshots();status('Committed')}else if(message.type==='stroke-rejected'){status('Stroke rejected; reloading',true);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision)}else if(message.type==='server-error')status('Canvas persistence is retrying…',true);else if(message.type==='presence')renderPresence(message.users);else if(message.type==='cursor')renderCursor(message)}}
+function connect(){if(socket)socket.close();clearTimeout(reconnectTimer);const protocol=location.protocol==='https:'?'wss:':'ws:',name=$('displayName').value.trim(),connection=new WebSocket(protocol+'//'+location.host+'/api/canvases/'+encodeURIComponent(currentId)+'/connect?name='+encodeURIComponent(name));socket=connection;connection.onopen=()=>{status('Connected');clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(connection.readyState===1)connection.send(JSON.stringify({type:'heartbeat'}))},20000)};connection.onclose=()=>{if(socket!==connection)return;clearInterval(heartbeatTimer);status('Disconnected',true);if(!leaving)reconnectTimer=setTimeout(()=>{if(currentId)connect()},1500)};connection.onmessage=async event=>{const message=JSON.parse(event.data);if(message.type==='welcome'){clientId=message.clientId;if(!$('displayName').value.trim())$('displayName').value=message.name;revision=message.revision;canvas.width=message.width;canvas.height=message.height;canvasBackground=message.background;setZoom(zoom);await loadImage(message.imageUrl)}else if(message.type==='stroke'){revision=message.revision;draw(message.from,message.to,message.size,activeColor(message.tool,message.color));status('Uncommitted changes')}else if(message.type==='reset'){revision=message.revision;await loadImage(message.imageUrl);status('Commit checked out')}else if(message.type==='reset-started')status('Checking out commit…');else if(message.type==='commit-created'){listSnapshots();status('Committed')}else if(message.type==='stroke-rejected'){status('Stroke rejected; reloading',true);await loadImage('/api/canvases/'+encodeURIComponent(currentId)+'/image?v='+revision)}else if(message.type==='server-error')status('Canvas persistence is retrying…',true);else if(message.type==='presence')renderPresence(message.users);else if(message.type==='cursor')renderCursor(message)}}
 function cursorColor(id){let hash=0;for(let i=0;i<id.length;i++)hash=(hash*31+id.charCodeAt(i))|0;return 'hsl('+Math.abs(hash%360)+' 85% 65%)'}
 function renderCursor(cursor){if(cursor.clientId===clientId)return;let element=cursorElements.get(cursor.clientId);if(cursor.visible===false){if(element)element.remove();cursorElements.delete(cursor.clientId);return}if(!element){element=document.createElement('div');element.className='remote-cursor';element.style.setProperty('--cursor-color',cursorColor(cursor.clientId));const arrow=document.createElement('span');arrow.className='cursor-arrow';const name=document.createElement('span');name.className='cursor-name';element.append(arrow,name);$('cursorLayer').append(element);cursorElements.set(cursor.clientId,element)}element.querySelector('.cursor-name').textContent=cursor.name;element.style.left=(cursor.x/canvas.width*100)+'%';element.style.top=(cursor.y/canvas.height*100)+'%'}
 function renderPresence(users){const root=$('presence');root.replaceChildren();const active=new Set(users.map(user=>user.clientId));for(const [id,element] of cursorElements){if(!active.has(id)){element.remove();cursorElements.delete(id)}}const label=document.createElement('span');label.className='presence-label';label.textContent='Viewing:';root.append(label);for(const user of users){const person=document.createElement('span');person.className='person'+(user.clientId===clientId?' me':'');person.textContent=user.name;person.title=user.name+(user.clientId===clientId?' (you)':'');root.append(person);const cursor=cursorElements.get(user.clientId);if(cursor)cursor.querySelector('.cursor-name').textContent=user.name}}
@@ -949,6 +986,7 @@ function selectTool(next){tool=next;$('brushBtn').classList.toggle('active',tool
 function updateName(){const name=$('displayName').value.trim();localStorage.setItem('snapshot-canvas-name',name);if(socket&&socket.readyState===1)socket.send(JSON.stringify({type:'set-name',name}))}
 $('displayName').value=localStorage.getItem('snapshot-canvas-name')||'';$('displayName').addEventListener('input',()=>{clearTimeout(nameTimer);nameTimer=setTimeout(updateName,250)});$('displayName').addEventListener('keydown',event=>{if(event.key==='Enter'){clearTimeout(nameTimer);updateName();event.target.blur()}});
 $('openBtn').onclick=()=>$('canvasDialog').showModal();$('closeDialog').onclick=()=>$('canvasDialog').close();$('createCanvasBtn').onclick=createCanvas;$('openExistingBtn').onclick=openExistingCanvas;$('existingCanvasId').addEventListener('keydown',event=>{if(event.key==='Enter')openExistingCanvas()});$('snapshotBtn').onclick=saveSnapshot;$('forkBtn').onclick=forkCanvas;$('brushBtn').onclick=()=>selectTool('brush');$('eraserBtn').onclick=()=>selectTool('eraser');$('size').oninput=()=>$('sizeValue').textContent=$('size').value;$('zoomIn').onclick=()=>setZoom(zoom*1.25);$('zoomOut').onclick=()=>setZoom(zoom/1.25);$('zoomReset').onclick=()=>setZoom(1);
+window.addEventListener('pagehide',()=>{leaving=true;clearInterval(heartbeatTimer);clearTimeout(reconnectTimer);if(socket&&socket.readyState<2)socket.close(1000,'page closed')});
 currentId=decodeURIComponent(location.pathname.split('/')[2]||'');loadCurrentCanvas();
 </script>
 </body></html>`;
