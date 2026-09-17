@@ -2,7 +2,7 @@
 
 A collaborative pixel drawing app built with Cloudflare Workers, Durable Objects, Containers, and Container snapshots.
 
-Each canvas ID maps to one Durable Object and one Durable Object-managed Container. The Durable Object orders and broadcasts brush strokes over WebSockets, while the Container owns the authoritative RGBA image and stores it at `/data/canvas.png`. Named Container snapshots provide revision checkpoints and restore.
+Each canvas ID maps to one Durable Object and one Durable Object-managed Container. The Durable Object orders and broadcasts brush strokes over WebSockets, while the Container owns the authoritative RGBA image and stores it at `/data/canvas.png`. Immutable Container snapshots act as commits in each canvas's history.
 
 See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 
@@ -18,8 +18,8 @@ See [`plan.md`](./plan.md) for the full architecture and delivery plan.
 - Cloud-formation guest names with optional custom display names
 - Client-side zoom from 25% through 3200%
 - Space-drag panning
-- Named Container snapshots
-- Snapshot history and collaborative restore
+- Container snapshots represented as named commits
+- Parent-linked commit history and collaborative reset
 - Forking the current canvas into a new canvas and Container
 - One Container per canvas ID
 
@@ -78,9 +78,10 @@ https://your-worker.your-subdomain.workers.dev/canvas/weekend-doodles
 4. Choose a brush color and size, then draw.
 5. Use the mouse wheel to zoom.
 6. Hold Space and drag to pan.
-7. Select **Save snapshot** to create a named checkpoint.
-8. Select **Restore** beside a snapshot to return every collaborator to that revision.
-9. Select **Fork canvas** to clone the current image into a new canvas with its own URL and Container.
+7. Select **Commit snapshot** and enter a commit message.
+8. Use the 👁, ⑂, and ↶ commit actions to preview, fork, or reset to a commit.
+9. Commit previews open at a shareable, read-only `/canvas/:id/commits/:commitId` page.
+10. Select **Fork** in the header to clone the current working image into a new canvas.
 
 Canvas creation is idempotent. Reopening an existing ID uses its original dimensions and background.
 
@@ -91,10 +92,13 @@ POST /api/canvases/:id
 GET  /api/canvases/:id
 GET  /api/canvases/:id/image
 GET  /api/canvases/:id/connect       # WebSocket upgrade
-POST /api/canvases/:id/snapshots
-GET  /api/canvases/:id/snapshots
+POST /api/canvases/:id/commits
+GET  /api/canvases/:id/commits
+GET  /api/canvases/:id/commits/:commitId
+GET  /api/canvases/:id/commits/:commitId/image
+POST /api/canvases/:id/commits/:commitId/fork
+POST /api/canvases/:id/commits/:commitId/reset
 POST /api/canvases/:id/fork
-POST /api/canvases/:id/snapshots/:snapshotId/restore
 ```
 
 Create or open a canvas:
@@ -113,24 +117,24 @@ Fetch the authoritative PNG:
 curl "$BASE/api/canvases/demo/image" --output demo.png
 ```
 
-Create a snapshot:
+Create a commit backed by a Container snapshot:
 
 ```bash
-curl -X POST "$BASE/api/canvases/demo/snapshots" \
+curl -X POST "$BASE/api/canvases/demo/commits" \
   -H 'Content-Type: application/json' \
-  --data '{"name":"First sketch"}'
+  --data '{"message":"First sketch","author":"Cirrus"}'
 ```
 
-List snapshots:
+List commits:
 
 ```bash
-curl "$BASE/api/canvases/demo/snapshots"
+curl "$BASE/api/canvases/demo/commits"
 ```
 
-Restore using an ID returned by the list endpoint:
+Reset using an ID returned by the list endpoint:
 
 ```bash
-curl -X POST "$BASE/api/canvases/demo/snapshots/SNAPSHOT_ID/restore"
+curl -X POST "$BASE/api/canvases/demo/commits/COMMIT_ID/reset"
 ```
 
 ## Container API
@@ -146,13 +150,14 @@ GET  /metadata
 GET  /health
 ```
 
-Before taking a snapshot, the Durable Object calls `/flush` so the checkpoint includes an atomically written PNG and metadata file. A restore destroys the running Container, starts from the selected immutable snapshot, verifies its metadata, and broadcasts a full image reset to connected clients.
+Before creating a commit, the Durable Object calls `/flush` so its Container snapshot includes an atomically written PNG and metadata file. Reset destroys the running Container, starts from the selected immutable snapshot, verifies its metadata, and broadcasts a full image reset to connected clients. Read-only commit pages use an ephemeral preview Container restored from the commit and stopped after inactivity.
 
 ## Current limitations
 
 - Snapshots are preview functionality and should not be treated as permanent backups.
 - The current MVP creates manual snapshots; automatic rolling snapshots are still planned.
-- A canvas without a snapshot is not yet recovered from an unexpected Container replacement.
+- When a stopped or replaced Container is needed again, the canvas restores its `HEAD` commit. Uncommitted work that existed only in the previous Container is discarded.
+- A canvas with no commits has no recovery checkpoint if its Container is replaced.
 - Authentication, permissions, and presence cursors are not implemented yet.
 - Forking depends on snapshot handles being reusable across Durable Object-managed Containers in the deployed preview runtime.
 - Optimistic browser rendering uses Canvas 2D strokes while the Container uses its own circle-stamping rasterizer, so a reconnect may produce very small edge differences until the browser reloads the canonical PNG.
